@@ -1,86 +1,92 @@
 diff --git tensorfold/families/qwen4_exp/cuda/decode.py tensorfold/families/qwen4_exp/cuda/decode.py
-index ae0d093..316133a 100644
+index 6548c6f..792f5f9 100644
 --- tensorfold/families/qwen4_exp/cuda/decode.py
 +++ tensorfold/families/qwen4_exp/cuda/decode.py
-@@ -13,7 +13,7 @@ from tensorfold.cuda.sampling import sample_rows
- from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
- 
- from . import CONFIDENCE, DEPTH
--from .forward import commit, forward
-+from .forward import commit, compute, forward, read_ahead, stage
- from .state import CAND, Buffers, State
- from .mtp import mtp_forward
- from .weights import Weights
-@@ -264,12 +264,17 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
-             mtp_forward(w, st, pb, [prompt[begin]], resume["tail"])
-             st.set_mtp_len(st.mtp_len + 1)
-     last = None
-+    history = st.ple_history
-     for start in range(begin, len(prompt), e.prefill_rows):
-         chunk = list(prompt[start:start + e.prefill_rows])
-         R = len(chunk)
-         final = start + R >= len(prompt)
-+        segs = stage(w, pb, [(st, chunk)])
-+        if not final and history is not None:   # the next chunk's n-gram rows are read while the GPU runs this one
-+            history = np.concatenate([history, np.asarray(chunk, dtype=np.int64)])[-(w.cfg.ngram_size - 1):]
-+            read_ahead(w, history, prompt[start + R:start + R + e.prefill_rows])
-         # only the prompt's last row is sampled: the head runs on the final chunk alone
--        logits = forward(w, st, pb, chunk, logits=final)
-+        logits = compute(w, segs, pb, logits=final)
-         if final:
-             last = logits.clone()
-         streams_last = pb.streams[R - 1:R].clone()
+@@ -292,7 +292,7 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, *, mtp: bool = T
+     point = keep_at - start if keep_at is not None and start < keep_at <= end else 0     # the kept point's row
+     cut = Cut(point) if 0 < point < R else None           # inside the chunk, not at its end
+     # only the prompt's last row is sampled: the head runs on the final chunk alone
+-    logits = forward(w, st, pb, chunk, logits=final, cut=cut)
++    logits = forward(w, st, pb, chunk, logits=final, cut=cut, ahead=prompt[end:end + e.prefill_rows])
+     last = logits.clone() if final else None
+     e.last_streams = pb.streams[R - 1:R].clone()
+     use_mtp = _absorbs(e, mtp)
 diff --git tensorfold/families/qwen4_exp/cuda/forward.py tensorfold/families/qwen4_exp/cuda/forward.py
-index 4e042c4..a091a18 100644
+index 0af42e6..be1b24f 100644
 --- tensorfold/families/qwen4_exp/cuda/forward.py
 +++ tensorfold/families/qwen4_exp/cuda/forward.py
-@@ -398,6 +398,17 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
+@@ -449,6 +449,20 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
      return segs
  
  
-+def read_ahead(w: Weights, history: np.ndarray, tokens: Sequence[int]) -> None:
-+    """Start reading the n-gram rows a later ``stage`` of ``tokens`` after ``history`` looks up (tables that read ahead)."""
++def read_ahead(w: Weights, st: State, tokens: Sequence[int], ahead: Sequence[int]) -> None:
++    """Start reading the n-gram rows a later ``stage`` of ``ahead`` looks up once ``tokens`` are committed (tables that read ahead)."""
 +
-+    toks = np.asarray(tokens, dtype=np.int64)
++    if st.ple_history is None or not len(ahead) or getattr(w, "x3", None) is not None:
++        return
++    history = np.concatenate([st.ple_history, np.asarray(tokens, dtype=np.int64)])[-(w.cfg.ngram_size - 1):]   # as commit leaves it
++    toks = np.asarray(ahead, dtype=np.int64)
 +    for layer in w.layers:
 +        p = layer.ple
-+        start = getattr(p.table, "read_ahead", None) if p is not None and w.x3 is None else None
++        start = getattr(p.table, "read_ahead", None) if p is not None else None
 +        if start is not None:
 +            start(p.ngram.ids(history, toks))
 +
 +
- def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True, context: int | None = None):
-     """The forward's GPU work on staged rows (capturable); ``context`` bounds the attention launches."""
+ def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True, context: int | None = None,
+             ends: Sequence[int] = (), cuts: Sequence[Cut] = ()):
+     """The forward's GPU work on staged rows (capturable); ``context`` bounds attention, ``ends`` get the head, ``cuts`` keep states."""
+@@ -491,12 +505,14 @@ def compute_mixed(w: Weights, dsegs: Sequence[Seg], db: Buffers, psegs: Sequence
  
-diff --git tensorfold/families/qwen4_exp/cuda/weights.py tensorfold/families/qwen4_exp/cuda/weights.py
-index 59e30cb..2bae392 100644
---- tensorfold/families/qwen4_exp/cuda/weights.py
-+++ tensorfold/families/qwen4_exp/cuda/weights.py
-@@ -10,7 +10,7 @@ from typing import Any
- import numpy as np
- import torch
+ @torch.no_grad()
+ def forward(w: Weights, st: State, b: Buffers, tokens: Sequence[int], *, logits: bool = True,
+-            cut: Cut | None = None):
++            cut: Cut | None = None, ahead: Sequence[int] = ()):
+     """Rows for ``tokens`` at positions st.pos .. st.pos + R - 1: logits [R, V] bf16 (a view of b.logits) and the residual streams b.streams[:R]. The committed state is unchanged until ``commit``; ``cut`` (a prompt chunk): keeps each DeltaNet layer's state at its row."""
  
--from ..host_table import BF16Table, HostTable, open_table, read_header as _header
-+from ..host_table import BF16Table, HostTable, ReadAhead, open_table, read_header as _header
- from ..ssd_table import SSDTable
- from .bf16 import b16_from_rows, make_b16, quantize4, stack_b16
- from .ngram import NGram
-@@ -177,7 +177,7 @@ class MoEW:
+     if cut is not None and not (b.prefill and cut.at == 0 and 0 < cut.row < len(tokens)):
+         raise ValueError(f"a prompt chunk of {len(tokens)} rows has no kept point at row {cut.row}")
+-    return compute(w, stage(w, b, [(st, tokens)]), b, logits=logits, cuts=() if cut is None else (cut,))
++    segs = stage(w, b, [(st, tokens)])
++    read_ahead(w, st, tokens, ahead)               # ``ahead``: the rows after these, read while the GPU runs these
++    return compute(w, segs, b, logits=logits, cuts=() if cut is None else (cut,))
  
- @dataclass
- class PLEW:
--    table: HostTable | SSDTable | BF16Table   # the 128 shards: host memory map, SSD at each lookup, or bf16 rows
-+    table: HostTable | SSDTable | BF16Table | ReadAhead   # host memory map, SSD at each lookup (read ahead), bf16 rows
-     key: Q4                   # [S*D, ple_dim]
-     value: Q4                 # [D, ple_dim]
-     norm_key: torch.Tensor    # [S*D] fp32
-@@ -514,7 +514,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
-                 headers[shard] = _header(model_dir / shard)
-             h = headers[shard]
-             files.append((model_dir / shard, h[key + ".weight"], h[key + ".scales"], h[key + ".biases"]))
--        table = SSDTable(files) if ple_on_ssd else HostTable(files)
-+        # from SSD, a prompt chunk's rows are read on a thread while the GPU runs the chunk before (the same bytes)
-+        table = ReadAhead(SSDTable(files)) if ple_on_ssd else HostTable(files)
-         if table.rows != ngram.rows:
-             raise ValueError(f"n-gram tables hold {table.rows} rows, expected {ngram.rows}")
-         conv = raw(name + ".conv1d.weight").reshape(cfg.streams * cfg.hidden, cfg.ple_kernel).to(torch.bfloat16)
+ 
+ @triton.jit
+diff --git tensorfold/families/qwen4_exp/cuda/multi.py tensorfold/families/qwen4_exp/cuda/multi.py
+index bdd3398..7c8c37c 100644
+--- tensorfold/families/qwen4_exp/cuda/multi.py
++++ tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -18,7 +18,7 @@ from tensorfold.engine.grammar import GrammarError
+ 
+ from .decode import PREFILL_ROWS, WARM_TAIL, Engine, draft, entry_end, prefill_begin
+ from . import attn_multi, gdn_multi
+-from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, stage
++from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, read_ahead, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .state import ENDS, Buffers, State
+ from ..cuda import CONFIDENCE, DEPTH
+@@ -272,6 +272,9 @@ class MultiDecoder:
+         t0 = time.perf_counter()
+         try:
+             segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
++            if len(pieces) == 1:                     # one prompt alone: its next pass is its next prefill_rows
++                s, a, n = pieces[0]
++                read_ahead(self.w, s.st, s.prompt[a:a + n], s.prompt[a + n:a + n + self.prefill_rows])
+             ends, cuts = self._end_rows(pieces, segs), self._cuts(pieces, segs)
+             logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts)
+             heads = logits[:len(ends)].clone() if ends else None
+diff --git tensorfold/families/qwen4_exp/host_table.py tensorfold/families/qwen4_exp/host_table.py
+index a8a970b..72b2910 100644
+--- tensorfold/families/qwen4_exp/host_table.py
++++ tensorfold/families/qwen4_exp/host_table.py
+@@ -304,7 +304,8 @@ def open_table(model_dir: Path, shards: list[tuple[str, str]], scale, *, ssd: bo
+         return FP8Table(files, scale("weight_scale"))
+     table = BF16Table(files) if used[0] == "bf16" else SSDTable(files) if ssd else HostTable(files)
+     table.weight_scale = float(scale("weight_scale"))
+-    return table
++    # from SSD, a prompt chunk's rows are read on a thread while the GPU runs the chunk before (the same bytes)
++    return ReadAhead(table) if isinstance(table, SSDTable) else table
+ 
+ 
+ class ReadAhead:

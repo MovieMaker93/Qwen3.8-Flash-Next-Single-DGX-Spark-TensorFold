@@ -1,0 +1,115 @@
+diff --git tensorfold/families/qwen4_exp/cuda/multi.py tensorfold/families/qwen4_exp/cuda/multi.py
+index bdd3398..f198128 100644
+--- tensorfold/families/qwen4_exp/cuda/multi.py
++++ tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ 
+ import numpy as np
+@@ -27,6 +28,8 @@ FIRST, STEP = 256, 8192          # rows an idle slot keeps; rows a stream's cach
+ GIB = 1024**3
+ SHARE = 0.0                      # --decode-share: a round alone takes this share of its pass's time (0: whole passes)
+ PASS_MIN = 128                   # the fewest prompt rows a round's pass takes
++COPY_MATCH = 8                   # copy drafts: the context's last this many tokens seen before, and as many after them
++COPY_RECOVER = 0.05              # a skipped copy raises the stream's copy score this much (copies are tried again)
+ 
+ 
+ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int, prefill_rows: int) -> Engine:
+@@ -51,6 +54,12 @@ class MultiDecoder:
+         rows = slots * (depth + 1)
+         # a round's window and a prompt pass share each layer's expert launch: the pass's buffers hold both
+         self.converged, self.prefill_rows = converges(w), prefill_rows
++        # TENSORFOLD_MTP_COPY=1: a stream whose context repeats earlier text drafts the continuation (prompt lookup)
++        self.copy = os.environ.get("TENSORFOLD_MTP_COPY", "0") == "1"
++        # a stream drafts copies while its copies land: the share of copied drafts its rounds keep, a moving average
++        self.copy_gate = float(os.environ.get("TENSORFOLD_MTP_COPY_GATE", "0.5"))
++        self.copy_score: dict[int, float] = {}         # stream id -> its copies' kept share (starts at 1)
++        self.copied: dict[int, int] = {}               # stream id -> copied drafts in its current window
+         # rounds beside a filling prompt size its pass so decoding keeps ``share`` of the pass's time (0: whole passes)
+         self.share, self.round_s, self.row_s = share, None, None
+         self.buf = Buffers(w, rows, capacity, moe_prefill=True)
+@@ -358,6 +367,10 @@ class MultiDecoder:
+             head += 1
+             if s.draft:                # the state one token before the prompt's end, which a next turn extends
+                 self._remember(list(s.prompt[:self._keep_at(s)]), st, *kept)
++            if self.copy and s.draft:
++                from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
++
++                s.copies = CopyIndex(COPY_MATCH)
+             s.context = list(s.prompt)
+             s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
+                              self.confidence) if mtp and s.count > 1 else []
+@@ -437,6 +450,11 @@ class MultiDecoder:
+             if s.probabilities is not None:
+                 capture(logits, [tokens[r] for r in path[1:]] + [end], [pos[r] for r in path],
+                         s.probabilities, rows=[a0 + r for r in path])
++        for s, (path, _) in zip(live, paths):            # the copies this round's window held: how many landed
++            n = self.copied.pop(s.sid, 0)
++            if n:
++                score = self.copy_score.get(s.sid, 1.0)
++                self.copy_score[s.sid] = 0.5 * score + 0.5 * min(1.0, (len(path) - 1) / n)
+         for s, rows in zip(live, gdn_multi.keep(tables, [len(path) for path, _ in paths])):
+             self.held[s.sid] = rows                      # the next round's trees fold these rows in first
+         kept = []
+@@ -452,7 +470,8 @@ class MultiDecoder:
+                     s.error = exc
+             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
+             kept.append((s, a0, rows[:len(path)], new, last))
+-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
++        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last],
++                        {s.sid: new for s, _, _, new, last in kept if s.copies is not None and not last})
+         for s, _, _, new, _ in kept:
+             if s.error is not None:
+                 s.done = True
+@@ -465,10 +484,13 @@ class MultiDecoder:
+         done = [s for s in live if s.done]
+         for s in done:                                   # a finished stream's state is never read again
+             self.held.pop(s.sid, None)
++            self.copy_score.pop(s.sid, None)
++            self.copied.pop(s.sid, None)
+         return failed + done + ended
+ 
+-    def _draft_all(self, streams: list) -> None:
+-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
++    def _draft_all(self, streams: list, new: dict | None = None) -> None:
++        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth; a stream
++        whose context (plus ``new[sid]``, its tokens this round) repeats earlier text drafts the continuation instead."""
+ 
+         for s, _, _ in streams:
+             s.drafts = []
+@@ -487,6 +509,22 @@ class MultiDecoder:
+         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
+             st.set_mtp_len(st.mtp_len + len(keep))
+         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
++        if new:
++            for s, _ in active:
++                if s.sid not in new:
++                    continue
++                score = self.copy_score.get(s.sid, 1.0)
++                if score < self.copy_gate:     # its copies have been missing: MTP drafts, and the score recovers
++                    self.copy_score[s.sid] = min(1.0, score + COPY_RECOVER)
++                    continue
++                s.context.extend(new[s.sid])   # the context as of the pending token, without copying it
++                s.drafts = s.copies.propose(s.context, max(room[s.sid], COPY_MATCH))[:room[s.sid]]
++                del s.context[len(s.context) - len(new[s.sid]):]
++                if s.drafts:
++                    self.copied[s.sid] = len(s.drafts)
++            active = [(s, row) for s, row in active if not s.drafts]
++            if not active:
++                return
+         for j in range(self.depth):
+             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
+             nxt = []
+@@ -557,6 +595,8 @@ class MultiDecoder:
+         for s in live:
+             self.streams.pop(s.sid, None)
+             self.held.pop(s.sid, None)
++            self.copy_score.pop(s.sid, None)
++            self.copied.pop(s.sid, None)
+             self._drop_kept(s.st)
+             self._shrink(s.st)
+             self.free.append(s.st)

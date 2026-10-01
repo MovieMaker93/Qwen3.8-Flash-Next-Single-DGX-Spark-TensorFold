@@ -18,7 +18,7 @@ MODEL_ID="${MODEL_ID:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"   # MLX 4-bit, gr
 # The patches and start.sh's flags are made for TensorFold v0.3.6.3 exactly (earlier releases lack --vision for
 # this model and the patches do not apply). After changing TF_VERSION, TF_REPO or BASE_IMAGE, run
 # `scripts/prepare.sh --rebuild`.
-TF_VERSION="${TF_VERSION:-v0.3.6.3}"
+TF_VERSION="${TF_VERSION:-v0.6.0}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 # Replies mostly in Chinese or Japanese: DRAFT_LANGUAGE=zh or ja (in .env) serves the second image, which adds that
@@ -105,7 +105,8 @@ check_draft_language() {
     die "DRAFT_LANGUAGE=$DRAFT_LANGUAGE: zh or ja (recommended), de, fr, pt or ru, or several like zh,ja"
 }
 # The patches baked into $IMAGE, in order: patches/*.patch, plus patches/languages/*.patch for DRAFT_LANGUAGE.
-patch_files() { ls patches/*.patch; [[ -z "$DRAFT_LANGUAGE" ]] || ls patches/languages/*.patch; }
+patch_files() { local p; for p in patches/*.patch; do [[ -e "$p" ]] && echo "$p"; done
+                [[ -z "$DRAFT_LANGUAGE" ]] || ls patches/languages/*.patch; }
 patches_hash() { patch_files 2>/dev/null | xargs -r cat | sha256sum | cut -c1-12; }
 
 # What scripts/prepare.sh last left ready (it writes this line to PREPARED_MARKER when it succeeds); start.sh runs
